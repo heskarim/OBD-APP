@@ -100,6 +100,9 @@ public class SettingsActivity
     static final String ELM_TIMING_SELECT = "adaptive_timing_mode";
     private static final String KEY_BITCOIN = "bitcoin";
     static final String KEY_APP_LANGUAGE = "app_language";
+    private static final String KEY_TEST_COOLANT_WARNING = "test_coolant_warning";
+    private static final String KEY_TEST_COOLANT_CRITICAL = "test_coolant_critical";
+    private static final String KEY_CLEAR_TEST_NOTIFICATIONS = "clear_test_notifications";
 
 	/**
 	 * Apply locale based on user preference
@@ -144,6 +147,7 @@ public class SettingsActivity
 		prefs = PreferenceManager.getDefaultSharedPreferences(this);
 
 		addPreferencesFromResource(R.xml.settings);
+		setupAutomationPreferences();
 
 		for (String key : extKeys)
 		{
@@ -165,6 +169,29 @@ public class SettingsActivity
 		findPreference(KEY_BITCOIN).setOnPreferenceClickListener(this);
 		// add handler for selection update
 		prefs.registerOnSharedPreferenceChangeListener(this);
+	}
+
+	void setupAutomationPreferences()
+	{
+		setEditPreferenceSummary(
+				AutomationSettings.KEY_APPROVED_DTCS,
+				getString(R.string.approved_auto_clear_dtcs_description));
+		setEditPreferenceSummary(
+				AutomationSettings.KEY_COOLANT_WARNING_THRESHOLD,
+				String.valueOf(AutomationSettings.DEFAULT_WARNING_THRESHOLD));
+		setEditPreferenceSummary(
+				AutomationSettings.KEY_COOLANT_CRITICAL_THRESHOLD,
+				String.valueOf(AutomationSettings.DEFAULT_CRITICAL_THRESHOLD));
+		findPreference(KEY_TEST_COOLANT_WARNING).setOnPreferenceClickListener(this);
+		findPreference(KEY_TEST_COOLANT_CRITICAL).setOnPreferenceClickListener(this);
+		findPreference(KEY_CLEAR_TEST_NOTIFICATIONS).setOnPreferenceClickListener(this);
+	}
+
+	void setEditPreferenceSummary(String key, String fallback)
+	{
+		EditTextPreference preference = (EditTextPreference)findPreference(key);
+		String value = preference.getText();
+		preference.setSummary(value == null || value.trim().isEmpty() ? fallback : value);
 	}
 
 		/**
@@ -356,6 +383,27 @@ public class SettingsActivity
 		@Override
 		public boolean onPreferenceClick(Preference preference)
 		{
+			if (KEY_TEST_COOLANT_WARNING.equals(preference.getKey()))
+			{
+				new VehicleAlertNotifier(this).showCoolantWarning(
+						AutomationSettings.DEFAULT_WARNING_THRESHOLD + 1.0);
+				Toast.makeText(this, R.string.test_coolant_warning, Toast.LENGTH_SHORT).show();
+				return true;
+			}
+			if (KEY_TEST_COOLANT_CRITICAL.equals(preference.getKey()))
+			{
+				new VehicleAlertNotifier(this).showCoolantCritical(
+						AutomationSettings.DEFAULT_CRITICAL_THRESHOLD + 1.0);
+				Toast.makeText(this, R.string.test_coolant_critical, Toast.LENGTH_SHORT).show();
+				return true;
+			}
+			if (KEY_CLEAR_TEST_NOTIFICATIONS.equals(preference.getKey()))
+			{
+				new VehicleAlertNotifier(this).clearCoolantAlerts();
+				Toast.makeText(this, R.string.clear_test_notifications, Toast.LENGTH_SHORT).show();
+				return true;
+			}
+
 			Intent intent = preference.getIntent();
 			try
 			{
@@ -407,6 +455,17 @@ public class SettingsActivity
 		{
 			Preference pref = findPreference(key);
 
+			if (AutomationSettings.KEY_APPROVED_DTCS.equals(key))
+			{
+				String current = sharedPreferences.getString(key, "");
+				String normalized = DtcAutoClearPolicy.formatCodes(DtcAutoClearPolicy.parseCodes(current));
+				if (!normalized.equals(current))
+				{
+					sharedPreferences.edit().putString(key, normalized).apply();
+					return;
+				}
+			}
+
 			if (pref instanceof ListPreference)
 			{
 				ListPreference currPref = (ListPreference) pref;
@@ -416,7 +475,10 @@ public class SettingsActivity
 			if (pref instanceof EditTextPreference)
 			{
 				EditTextPreference currPref = (EditTextPreference) pref;
-				currPref.setSummary(currPref.getText());
+				String value = currPref.getText();
+				currPref.setSummary(value == null || value.trim().isEmpty()
+						? currPref.getDialogTitle()
+						: value);
 			}
 
 			if(KEY_COMM_MEDIUM.equals(key))

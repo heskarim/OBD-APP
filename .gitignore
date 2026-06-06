@@ -9,3 +9,15 @@
 **/*.iml
 *~
 local.properties
+*.apk
+*.jks
+*.keystore
+codex-session-*.json
+codex-session-*.jsonl
+androbd-diagnostic-*/
+androbd-diagnostic-*.zip
+hs_err_pid*.log
+replay_pid*.log
+**/hs_err_pid*.log
+**/replay_pid*.log
+docs/superpowers/plans/

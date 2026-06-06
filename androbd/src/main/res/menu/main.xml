@@ -34,6 +34,19 @@
         android:id="@+id/load"
         android:icon="@drawable/ic_action_load"
         android:title="@string/load"/>
+    <item
+        android:id="@+id/recording"
+        android:icon="@android:drawable/ic_btn_speak_now"
+        android:title="@string/recording"/>
+    <item
+        android:id="@+id/diagnostic_logs"
+        android:icon="@android:drawable/ic_menu_info_details"
+        android:showAsAction="always"
+        android:title="@string/diagnostic_logs"/>
+    <item
+        android:id="@+id/check_updates"
+        android:icon="@android:drawable/stat_sys_download_done"
+        android:title="@string/check_updates"/>
     
     <!-- Display and View Options -->
     <item

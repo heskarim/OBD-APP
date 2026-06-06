@@ -755,18 +755,26 @@ public class ElmProt
 
 					case NODATA:
 						setStatus(STAT.NODATA);
-						// re-queue next data item
-						if (service != OBD_SVC_NONE)
+						/*
+						 * NO DATA is a valid result while reading DTC groups.
+						 * Continue the queued stored/pending/permanent requests
+						 * without forcing a protocol reconnect.
+						 */
+						if (service != OBD_SVC_READ_CODES)
 						{
-							cmdQueue.add(
-								String.valueOf(
-									createTelegram(emptyBuffer, service, getNextSupportedPid()))
-							);
+							// re-queue next data item
+							if (service != OBD_SVC_NONE)
+							{
+								cmdQueue.add(
+									String.valueOf(
+										createTelegram(emptyBuffer, service, getNextSupportedPid()))
+								);
+							}
+							// increase OBD timeout since we may expect answers too fast
+							mAdaptiveTiming.adapt(true);
+							// set to preferred protocol
+							pushCommand(CMD.SETPROT, preferredProtocol.ordinal());
 						}
-						// increase OBD timeout since we may expect answers too fast
-						mAdaptiveTiming.adapt(true);
-						// set to preferred protocol
-						pushCommand(CMD.SETPROT, preferredProtocol.ordinal());
 						// NO break here since reaction is only quqeued
 					
 					case MODEL:

@@ -26,6 +26,9 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.io.OutputStreamWriter;
 import java.util.Vector;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
@@ -40,6 +43,7 @@ public class StreamHandler implements TelegramWriter, Runnable
 	private static final Logger log = Logger.getLogger("stream");
 	private InputStream in;
 	private BufferedWriter out;
+	private final ThreadPoolExecutor txExecutor = createTxExecutor();
 	
 	private TelegramListener messageHandler;
 	// current receive message
@@ -90,16 +94,17 @@ public class StreamHandler implements TelegramWriter, Runnable
 	public int writeTelegram(final char[] buffer, int type, Object id)
 	{
 		int result = buffer.length;
+		final char[] telegram = buffer.clone();
 		
-		// Send data threaded to de-couple from main thread
-		new Thread(new Runnable()
+		// A single worker preserves command boundaries and submission order.
+		txExecutor.execute(new Runnable()
 		{
 			@Override
 			public void run()
 			{
 				try
 				{
-					String msg = new String(buffer);
+					String msg = new String(telegram);
 					msg += "\r";
 					
 					log.finer(this.toString() + " TX:"
@@ -111,12 +116,30 @@ public class StreamHandler implements TelegramWriter, Runnable
 				catch (Exception ex)
 				{
 					log.severe("TX error:'"
-					           + ProtUtils.hexDumpBuffer(buffer) + "':"
+					           + ProtUtils.hexDumpBuffer(telegram) + "':"
 					           + ex.getStackTrace());
 				}
 			}
-		}).start();
+		});
 		return (result);
+	}
+
+	private static ThreadPoolExecutor createTxExecutor()
+	{
+		ThreadPoolExecutor executor = new ThreadPoolExecutor(
+				1,
+				1,
+				30,
+				TimeUnit.SECONDS,
+				new LinkedBlockingQueue<>(),
+				runnable ->
+				{
+					Thread thread = new Thread(runnable, "StreamHandler-TX");
+					thread.setDaemon(true);
+					return thread;
+				});
+		executor.allowCoreThreadTimeOut(true);
+		return executor;
 	}
 	
 	/**

@@ -1,5 +1,10 @@
 apply plugin: 'com.android.application'
 
+def appVersionCode = (System.getenv("VERSION_CODE") ?: "20710").toInteger()
+def appVersionName = System.getenv("VERSION_NAME") ?: "V2.7.9-ai-logging-autoupdate"
+def releaseKeystoreFile = System.getenv("ANDROID_KEYSTORE_FILE")
+def hasReleaseSigning = releaseKeystoreFile != null && releaseKeystoreFile.trim().length() > 0
+
 android {
     namespace = 'com.fr3ts0n.ecu.gui.androbd'
     compileSdk 36
@@ -12,12 +17,14 @@ android {
     defaultConfig {
         minSdkVersion 17
         targetSdkVersion 36
-        versionCode 20709
-        versionName 'V2.7.9'
+        versionCode appVersionCode
+        versionName appVersionName
 
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
 
         resValue "string", "app_version", versionName
+        buildConfigField "String", "GITHUB_UPDATE_OWNER", '"heskarim"'
+        buildConfigField "String", "GITHUB_UPDATE_REPO", '"OBD-APP"'
 
         compileOptions {
             sourceCompatibility JavaVersion.VERSION_17
@@ -27,6 +34,26 @@ android {
         lintOptions {
             // Override lint error on targetSdkVersion
             abortOnError = false
+        }
+    }
+
+    signingConfigs {
+        release {
+            if (hasReleaseSigning) {
+                storeFile file(releaseKeystoreFile)
+                storePassword System.getenv("ANDROID_KEYSTORE_PASSWORD")
+                keyAlias System.getenv("ANDROID_KEY_ALIAS")
+                keyPassword System.getenv("ANDROID_KEY_PASSWORD")
+            }
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            if (hasReleaseSigning) {
+                signingConfig signingConfigs.release
+            }
         }
     }
 }

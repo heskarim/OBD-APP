@@ -1,0 +1,62 @@
+name: Android release APK
+
+on:
+  push:
+    branches:
+      - master
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          submodules: recursive
+
+      - name: Set up JDK
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Prepare version
+        shell: bash
+        run: |
+          VERSION_CODE=$((20710 + GITHUB_RUN_NUMBER))
+          VERSION_NAME="V2.7.9-ai-${GITHUB_SHA::7}"
+          echo "VERSION_CODE=$VERSION_CODE" >> "$GITHUB_ENV"
+          echo "VERSION_NAME=$VERSION_NAME" >> "$GITHUB_ENV"
+
+      - name: Decode release keystore
+        shell: bash
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          echo "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/obd-release.jks"
+          echo "ANDROID_KEYSTORE_FILE=$RUNNER_TEMP/obd-release.jks" >> "$GITHUB_ENV"
+
+      - name: Build release APK
+        env:
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: ./gradlew :androbd:assembleRelease --no-daemon --max-workers=2
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: app-${{ github.run_number }}
+          name: OBD APP ${{ env.VERSION_NAME }}
+          make_latest: true
+          body: |
+            version_code=${{ env.VERSION_CODE }}
+            version_name=${{ env.VERSION_NAME }}
+            commit=${{ github.sha }}
+          files: androbd/build/outputs/apk/release/androbd-release.apk

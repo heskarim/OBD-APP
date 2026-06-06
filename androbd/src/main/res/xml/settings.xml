@@ -4,6 +4,78 @@
                   android:title="@string/settings">
 
     <PreferenceScreen
+        android:icon="@android:drawable/ic_dialog_alert"
+        android:summary="@string/automation_alerts_description"
+        android:title="@string/automation_alerts">
+
+        <PreferenceCategory android:title="@string/dtc_automation">
+            <CheckBoxPreference
+                android:defaultValue="false"
+                android:key="auto_clear_known_dtcs"
+                android:summary="@string/auto_clear_known_dtcs_description"
+                android:title="@string/auto_clear_known_dtcs" />
+
+            <EditTextPreference
+                android:capitalize="characters"
+                android:defaultValue=""
+                android:dependency="auto_clear_known_dtcs"
+                android:dialogTitle="@string/approved_auto_clear_dtcs"
+                android:inputType="textCapCharacters"
+                android:key="approved_auto_clear_dtcs"
+                android:summary="@string/approved_auto_clear_dtcs_description"
+                android:title="@string/approved_auto_clear_dtcs" />
+        </PreferenceCategory>
+
+        <PreferenceCategory android:title="@string/coolant_alerts">
+            <CheckBoxPreference
+                android:defaultValue="false"
+                android:key="coolant_monitoring_enabled"
+                android:summary="@string/coolant_monitoring_enabled_description"
+                android:title="@string/coolant_monitoring_enabled" />
+
+            <EditTextPreference
+                android:defaultValue="100"
+                android:dependency="coolant_monitoring_enabled"
+                android:dialogTitle="@string/coolant_warning_threshold"
+                android:inputType="number"
+                android:key="coolant_warning_threshold"
+                android:summary="@string/coolant_warning_threshold_description"
+                android:title="@string/coolant_warning_threshold" />
+
+            <EditTextPreference
+                android:defaultValue="110"
+                android:dependency="coolant_monitoring_enabled"
+                android:dialogTitle="@string/coolant_critical_threshold"
+                android:inputType="number"
+                android:key="coolant_critical_threshold"
+                android:summary="@string/coolant_critical_threshold_description"
+                android:title="@string/coolant_critical_threshold" />
+
+            <Preference
+                android:key="notification_policy_access"
+                android:summary="@string/notification_policy_access_description"
+                android:title="@string/notification_policy_access">
+                <intent android:action="android.settings.NOTIFICATION_POLICY_ACCESS_SETTINGS" />
+            </Preference>
+
+            <Preference
+                android:key="test_coolant_warning"
+                android:summary="@string/test_coolant_warning_description"
+                android:title="@string/test_coolant_warning" />
+
+            <Preference
+                android:key="test_coolant_critical"
+                android:summary="@string/test_coolant_critical_description"
+                android:title="@string/test_coolant_critical" />
+
+            <Preference
+                android:key="clear_test_notifications"
+                android:summary="@string/clear_test_notifications_description"
+                android:title="@string/clear_test_notifications" />
+        </PreferenceCategory>
+    </PreferenceScreen>
+
+    <PreferenceScreen
         android:icon="@android:drawable/ic_menu_manage"
         android:summary="@string/common_settings_description"
         android:title="@string/common_settings">

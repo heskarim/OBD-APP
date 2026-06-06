@@ -67,6 +67,38 @@ period of time while the ECU recalibrates itself.
     <string name="snapshot">snapshot</string>
     <string name="save">Save measurement</string>
     <string name="load">Load measurement</string>
+    <string name="recording">Recording</string>
+    <string name="recording_start">Start recording</string>
+    <string name="recording_stop">Stop recording</string>
+    <string name="recording_export">Export</string>
+    <string name="recording_not_started">Recorder is stopped. Samples: %1$d. Events: %2$d. DTC clears: %3$d.</string>
+    <string name="recording_active">Recording. Duration: %1$d s. Samples: %2$d. Events: %3$d. DTC clears: %4$d.</string>
+    <string name="recording_started">Recording started</string>
+    <string name="recording_stopped">Recording stopped</string>
+    <string name="recording_no_samples">No recording samples to export yet</string>
+    <string name="recording_export_name">androbd-session.zip</string>
+    <string name="recording_exported">Recording exported</string>
+    <string name="recording_exported_to">Recording exported to Downloads: %s</string>
+    <string name="recording_export_failed">Recording export failed: %s</string>
+    <string name="diagnostic_logs">Diagnostic logs</string>
+    <string name="check_updates">Check for updates</string>
+    <string name="update_available_title">Update available</string>
+    <string name="update_available_message">%1$s is available (version code %2$d).</string>
+    <string name="update_install">Download and install</string>
+    <string name="update_already_current">App is already current</string>
+    <string name="update_check_failed">Update check failed: %s</string>
+    <string name="update_downloading">Downloading update</string>
+    <string name="update_download_failed">Update download failed: %s</string>
+    <string name="update_install_permission_needed">Allow this app to install updates, then check again</string>
+    <string name="diagnostic_logging_start">Start diagnostic logging</string>
+    <string name="diagnostic_logging_stop">Stop diagnostic logging</string>
+    <string name="diagnostic_logging_export">Export logs</string>
+    <string name="diagnostic_logging_inactive">Logging is stopped. Start it before connecting to the OBD adapter.</string>
+    <string name="diagnostic_logging_active">Detailed OBD logging is active. Reproduce the problem, then export the logs.</string>
+    <string name="diagnostic_logging_started">Diagnostic logging started</string>
+    <string name="diagnostic_logging_stopped">Diagnostic logging stopped</string>
+    <string name="diagnostic_logging_exported">Diagnostic logs exported to Downloads: %s</string>
+    <string name="diagnostic_logging_failed">Diagnostic logging failed: %s</string>
     <string name="saved_data">Saved Data</string>
     <string name="no_obd_files_found">No OBD files found</string>
     <string name="loaded">loaded</string>
@@ -80,6 +112,48 @@ period of time while the ECU recalibrates itself.
     <string name="filter">Filter selected</string>
     <!-- Settings -->
     <string name="settings">Settings</string>
+    <string name="automation_alerts">Automation / Alerts</string>
+    <string name="automation_alerts_description">Safe DTC auto-clear and engine coolant alerts</string>
+    <string name="dtc_automation">DTC automation</string>
+    <string name="auto_clear_known_dtcs">Safe auto-clear approved DTCs</string>
+    <string name="auto_clear_known_dtcs_description">Clear only when every detected fault code is approved</string>
+    <string name="approved_auto_clear_dtcs">Approved DTC codes</string>
+    <string name="approved_auto_clear_dtcs_description">Comma-separated codes, for example P0420, P0441</string>
+    <string name="coolant_alerts">Engine coolant alerts</string>
+    <string name="coolant_monitoring_enabled">Monitor coolant temperature</string>
+    <string name="coolant_monitoring_enabled_description">Show warning and critical alarms from standard coolant PID 0x05</string>
+    <string name="coolant_warning_threshold">Warning threshold [C]</string>
+    <string name="coolant_warning_threshold_description">Default: 100 C</string>
+    <string name="coolant_critical_threshold">Critical alarm threshold [C]</string>
+    <string name="coolant_critical_threshold_description">Default: 110 C</string>
+    <string name="notification_policy_access">Allow alarms through Do Not Disturb</string>
+    <string name="notification_policy_access_description">Open Android settings and grant AndrOBD notification policy access</string>
+    <string name="test_coolant_warning">Test coolant warning notification</string>
+    <string name="test_coolant_warning_description">Show the same warning notification used by live coolant monitoring</string>
+    <string name="test_coolant_critical">Test critical coolant alarm</string>
+    <string name="test_coolant_critical_description">Show the same alarm used when coolant reaches the critical threshold</string>
+    <string name="clear_test_notifications">Clear test notifications</string>
+    <string name="clear_test_notifications_description">Dismiss coolant and DTC clear notifications</string>
+    <string name="add_to_approved_dtcs">Add %s to approved auto-clear list</string>
+    <string name="remove_from_approved_dtcs">Remove %s from approved auto-clear list</string>
+    <string name="search_dtc_online">Search DTC online</string>
+    <string name="dtc_approved_added">%s added to approved auto-clear list</string>
+    <string name="dtc_approved_removed">%s removed from approved auto-clear list</string>
+    <string name="auto_clearing_approved_dtcs">Auto-clearing approved DTCs: %s</string>
+    <string name="unknown_dtc_title">Unknown DTC detected - not cleared</string>
+    <string name="unknown_dtc_message">Inspect these new codes: %s</string>
+    <string name="coolant_warning_title">Engine coolant temperature warning</string>
+    <string name="coolant_warning_message">Coolant temperature is %.1f C</string>
+    <string name="coolant_critical_title">CRITICAL: Engine overheating</string>
+    <string name="coolant_critical_message">Coolant temperature is %.1f C. Stop safely and inspect the engine.</string>
+    <string name="coolant_critical_message_short">Stop safely and inspect the engine.</string>
+    <string name="dtc_clear_notification_title">DTC clear requested</string>
+    <string name="dtc_clear_notification_message">Codes: %1$s. Total clear requests: %2$d.</string>
+    <string name="acknowledge">Acknowledge</string>
+    <string name="vehicle_warning_channel">Vehicle warnings</string>
+    <string name="vehicle_warning_channel_description">Unknown DTC and coolant warning notifications</string>
+    <string name="vehicle_critical_channel">Critical vehicle alarms</string>
+    <string name="vehicle_critical_channel_description">High-priority engine coolant alarms</string>
     <string name="common_settings">Common settings</string>
     <string name="measure_system_description">Measurement units system (metric / imperial)</string>
     <string name="measure_system">Measurement units</string>
@@ -268,7 +342,7 @@ period of time while the ECU recalibrates itself.
     </string>
     <string name="graphic_design">Graphic design</string>
     <string name="design_credits" translatable="false">2018 by @anaufalm</string>
-    <string name="long_press_dfc_hint">Long press DFC for online search …</string>
+    <string name="long_press_dfc_hint">Long press a DTC to approve, remove, or search it</string>
     <string-array name="csv_field_delim_options" translatable="false">
         <item>@string/tab</item>
         <item>@string/comma</item>

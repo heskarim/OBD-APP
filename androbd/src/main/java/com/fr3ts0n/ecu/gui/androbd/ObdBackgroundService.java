@@ -18,35 +18,57 @@
 
 package com.fr3ts0n.ecu.gui.androbd;
 
+import android.Manifest;
 import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.PendingIntent;
 import android.app.Service;
+import android.bluetooth.BluetoothAdapter;
+import android.bluetooth.BluetoothDevice;
 import android.content.Context;
 import android.content.Intent;
+import android.content.SharedPreferences;
+import android.content.pm.PackageManager;
 import android.os.Binder;
 import android.os.Build;
 import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
+import android.preference.PreferenceManager;
+
 import androidx.core.app.NotificationCompat;
 
+import com.fr3ts0n.ecu.EcuDataPv;
+import com.fr3ts0n.ecu.prot.obd.ElmProt;
+import com.fr3ts0n.ecu.prot.obd.ObdProt;
+import com.fr3ts0n.pvs.PvChangeEvent;
+import com.fr3ts0n.pvs.PvChangeListener;
+
+import java.beans.PropertyChangeEvent;
+import java.beans.PropertyChangeListener;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Set;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.logging.Logger;
 
 /**
  * Background service for OBD communication
  * Provides continuous monitoring and data collection even when app is in background
  */
-public class ObdBackgroundService extends Service {
+public class ObdBackgroundService extends Service
+        implements SharedPreferences.OnSharedPreferenceChangeListener, PvChangeListener, PropertyChangeListener {
     
     private static final String TAG = "ObdBackgroundService";
     private static final Logger log = Logger.getLogger(TAG);
     
     public static final String CHANNEL_ID = "obd_service_channel";
+    public static final String ACTION_START_MONITORING = "com.fr3ts0n.ecu.gui.androbd.START_MONITORING";
     private static final int NOTIFICATION_ID = 1001;
+    private static final long RECONNECT_DELAY_MS = 15000;
+    private static final long AUTO_CONNECT_WATCHDOG_MS = 30000;
+    private static final long PROTOCOL_REFRESH_DELAY_MS = 30000;
     
     // Service states
     public enum ServiceState {
@@ -55,8 +77,39 @@ public class ObdBackgroundService extends Service {
     
     private ServiceState currentState = ServiceState.STOPPED;
     private CommService commService;
+    private CommService.MEDIUM activeMedium;
+    private String currentAddress;
+    private boolean autoReconnectEnabled = true;
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
-    private final List<ServiceStateListener> stateListeners = new ArrayList<>();
+    private final List<ServiceStateListener> stateListeners = new CopyOnWriteArrayList<>();
+    private boolean foregroundStarted;
+    private final Runnable reconnectRunnable = this::connectToSavedDevice;
+    private final Runnable protocolRefreshRunnable = () -> refreshSavedConnection("protocol-health");
+    private final Runnable autoConnectWatchdogRunnable = new Runnable()
+    {
+        @Override
+        public void run()
+        {
+            if (!autoReconnectEnabled)
+            {
+                return;
+            }
+            connectToSavedDeviceIfIdle("watchdog");
+            mainHandler.postDelayed(this, AUTO_CONNECT_WATCHDOG_MS);
+        }
+    };
+    private SharedPreferences preferences;
+    private AutomationSettings automationSettings;
+    private VehicleAlertNotifier vehicleAlertNotifier;
+    private VehicleEventLog vehicleEventLog;
+    private EcuDataPv coolantDataPv;
+    private final PvChangeListener coolantChangeListener = event -> {
+        if (EcuDataPv.FIELDS[EcuDataPv.FID_VALUE].equals(event.getKey())
+                && event.getValue() instanceof Number) {
+            double temperature = ((Number) event.getValue()).doubleValue();
+            mainHandler.post(() -> evaluateCoolantTemperature(temperature));
+        }
+    };
     
     // Binder for local service binding
     public class LocalBinder extends Binder {
@@ -77,16 +130,29 @@ public class ObdBackgroundService extends Service {
     @Override
     public void onCreate() {
         super.onCreate();
+        preferences = PreferenceManager.getDefaultSharedPreferences(this);
+        automationSettings = new AutomationSettings(preferences);
+        vehicleAlertNotifier = new VehicleAlertNotifier(this);
+        vehicleEventLog = VehicleEventLog.getShared();
+        preferences.registerOnSharedPreferenceChangeListener(this);
+        ObdProt.PidPvs.addPvChangeListener(this, PvChangeEvent.PV_ADDED | PvChangeEvent.PV_CLEARED);
+        CommService.elm.addPropertyChangeListener(this);
+        attachExistingCoolantPid();
         createNotificationChannel();
         log.info("ObdBackgroundService created");
     }
     
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
-        if (currentState == ServiceState.STOPPED) {
+        autoReconnectEnabled = true;
+        if (!foregroundStarted) {
             startForegroundService();
+        }
+        if (commService == null) {
             initializeCommService();
         }
+        connectToSavedDevice();
+        startAutoConnectWatchdog();
         // Return sticky to restart service if killed by system
         return START_STICKY;
     }
@@ -98,6 +164,13 @@ public class ObdBackgroundService extends Service {
     
     @Override
     public void onDestroy() {
+        mainHandler.removeCallbacks(reconnectRunnable);
+        mainHandler.removeCallbacks(protocolRefreshRunnable);
+        mainHandler.removeCallbacks(autoConnectWatchdogRunnable);
+        detachCoolantListener();
+        ObdProt.PidPvs.removePvChangeListener(this);
+        CommService.elm.removePropertyChangeListener(this);
+        preferences.unregisterOnSharedPreferenceChangeListener(this);
         stopCommService();
         currentState = ServiceState.STOPPED;
         notifyStateListeners();
@@ -108,6 +181,7 @@ public class ObdBackgroundService extends Service {
     private void startForegroundService() {
         Notification notification = createNotification("OBD Service Running", "Monitoring vehicle data...");
         startForeground(NOTIFICATION_ID, notification);
+        foregroundStarted = true;
         currentState = ServiceState.RUNNING;
         notifyStateListeners();
     }
@@ -146,6 +220,13 @@ public class ObdBackgroundService extends Service {
     }
     
     private void initializeCommService() {
+        BackgroundAutoConnectConfig config = readAutoConnectConfig();
+        CommService.medium = config.medium;
+        if (requiresBluetoothPermission(config.medium) && !hasBluetoothConnectPermission()) {
+            updateNotification("OBD Service", "Waiting for Bluetooth permission");
+            return;
+        }
+
         // Initialize communication service based on selected medium
         Handler serviceHandler = new Handler(Looper.getMainLooper()) {
             @Override
@@ -158,6 +239,9 @@ public class ObdBackgroundService extends Service {
             case BLUETOOTH:
                 commService = new BtCommService(this, serviceHandler);
                 break;
+            case BLE:
+                commService = new BleCommService(this, serviceHandler);
+                break;
             case USB:
                 commService = new UsbCommService(this, serviceHandler);
                 break;
@@ -167,6 +251,7 @@ public class ObdBackgroundService extends Service {
         }
         
         if (commService != null) {
+            activeMedium = CommService.medium;
             commService.start();
         }
     }
@@ -176,6 +261,8 @@ public class ObdBackgroundService extends Service {
             commService.stop();
             commService = null;
         }
+        activeMedium = null;
+        currentAddress = null;
     }
     
     private void handleCommServiceMessage(android.os.Message msg) {
@@ -189,6 +276,16 @@ public class ObdBackgroundService extends Service {
                 // Update notification based on connection state
                 String notificationText = getNotificationTextForState(state);
                 updateNotification("OBD Service", notificationText);
+                if (state == CommService.STATE.CONNECTED) {
+                    ElmProt.runDemo = false;
+                    mainHandler.removeCallbacks(protocolRefreshRunnable);
+                    CommService.elm.reset();
+                    attachExistingCoolantPid();
+                } else if (state == CommService.STATE.OFFLINE || state == CommService.STATE.NONE) {
+                    mainHandler.removeCallbacks(protocolRefreshRunnable);
+                    CoolantAlertDispatcher.reset(vehicleAlertNotifier, "transport-offline");
+                    scheduleReconnect();
+                }
                 break;
                 
             case MainActivity.MESSAGE_DATA_ITEMS_CHANGED:
@@ -204,7 +301,7 @@ public class ObdBackgroundService extends Service {
             case CONNECTING:
                 return "Connecting to OBD device...";
             case CONNECTED:
-                return "Connected - Monitoring vehicle data";
+                return getProtocolNotificationText(CommService.elm.getStatus());
             case LISTEN:
                 return "Waiting for connection...";
             default:
@@ -221,16 +318,133 @@ public class ObdBackgroundService extends Service {
     }
     
     // Public methods for service control
-    public void connectToDevice(Object device, boolean secure) {
-        if (commService != null) {
+    public void connectToBluetoothDevice(String address, CommService.MEDIUM medium, boolean secure) {
+        if (medium != CommService.MEDIUM.BLUETOOTH && medium != CommService.MEDIUM.BLE) {
+            return;
+        }
+        preferences.edit()
+                .putString(BackgroundAutoConnectConfig.KEY_LAST_DEV_ADDRESS, address)
+                .putBoolean(BackgroundAutoConnectConfig.KEY_BT_SECURE_CONNECTION, secure)
+                .putString(BackgroundAutoConnectConfig.KEY_COMM_MEDIUM, String.valueOf(medium.ordinal()))
+                .apply();
+        connectToBluetoothDevice(address, medium, secure, false);
+    }
+
+    public void connectToSavedDevice() {
+        BackgroundAutoConnectConfig config = readAutoConnectConfig();
+        if (!config.canAutoConnect()) {
+            log.info("Auto-connect skipped: no saved Bluetooth OBD adapter");
+            updateNotification("OBD Service", "Waiting for saved Bluetooth OBD adapter");
+            return;
+        }
+        log.info("Auto-connect attempting saved OBD adapter medium=" + config.medium + " address=" + config.address);
+        connectToBluetoothDevice(config.address, config.medium, config.secure, true);
+    }
+
+    private void connectToSavedDeviceIfIdle(String reason) {
+        BackgroundAutoConnectConfig config = readAutoConnectConfig();
+        if (!config.canAutoConnect()) {
+            return;
+        }
+        CommService.STATE state = commService != null ? commService.getState() : CommService.STATE.NONE;
+        if (state == CommService.STATE.CONNECTED) {
+            if (ObdConnectionHealth.shouldRefreshConnection(state, CommService.elm.getStatus())) {
+                refreshSavedConnection(reason);
+            }
+            return;
+        }
+        if (state == CommService.STATE.CONNECTING) {
+            return;
+        }
+        log.info("Auto-connect retry source=" + reason + " state=" + state);
+        connectToBluetoothDevice(config.address, config.medium, config.secure, true);
+    }
+
+    private void connectToBluetoothDevice(
+            String address,
+            CommService.MEDIUM medium,
+            boolean secure,
+            boolean savedConnection) {
+        autoReconnectEnabled = true;
+        mainHandler.removeCallbacks(reconnectRunnable);
+        CommService.medium = medium;
+
+        BluetoothAdapter adapter = BluetoothAdapter.getDefaultAdapter();
+        if (adapter == null || !adapter.isEnabled()) {
+            log.info("Auto-connect waiting: Bluetooth adapter is off or unavailable");
+            updateNotification("OBD Service", "Waiting for Bluetooth to turn on");
+            scheduleReconnect();
+            return;
+        }
+        if (!hasBluetoothConnectPermission()) {
+            log.info("Auto-connect waiting: missing Bluetooth connect permission");
+            updateNotification("OBD Service", "Waiting for Bluetooth permission");
+            return;
+        }
+
+        if (commService != null && activeMedium != medium) {
+            stopCommService();
+        }
+        if (commService == null) {
+            initializeCommService();
+        }
+        if (commService == null) {
+            return;
+        }
+
+        CommService.STATE state = commService.getState();
+        if ((state == CommService.STATE.CONNECTED || state == CommService.STATE.CONNECTING)
+                && address.equals(currentAddress)) {
+            if (state == CommService.STATE.CONNECTING
+                    || ObdConnectionHealth.isVehicleResponsive(state, CommService.elm.getStatus())) {
+                return;
+            }
+            log.info("Refreshing stale OBD connection for saved adapter address=" + address
+                    + " protocol=" + CommService.elm.getStatus());
+            stopCommService();
+            initializeCommService();
+            if (commService == null) {
+                return;
+            }
+            state = commService.getState();
+        }
+        if (state == CommService.STATE.CONNECTED || state == CommService.STATE.CONNECTING) {
+            stopCommService();
+            initializeCommService();
+        }
+
+        try {
+            BluetoothDevice device = medium == CommService.MEDIUM.BLE && Build.VERSION.SDK_INT >= Build.VERSION_CODES.JELLY_BEAN_MR2
+                    ? adapter.getRemoteLeDevice(address, BluetoothDevice.ADDRESS_TYPE_PUBLIC)
+                    : adapter.getRemoteDevice(address);
+            currentAddress = address;
+            updateNotification(
+                    "OBD Service",
+                    savedConnection ? "Connecting to saved OBD adapter..." : "Connecting to OBD adapter...");
+            log.info("Connecting to OBD adapter medium=" + medium + " address=" + address + " saved=" + savedConnection);
             commService.connect(device, secure);
+        } catch (IllegalArgumentException e) {
+            log.warning("Invalid saved Bluetooth address: " + address);
+            updateNotification("OBD Service", "Saved OBD adapter address is invalid");
         }
     }
     
     public void disconnect() {
+        autoReconnectEnabled = false;
+        mainHandler.removeCallbacks(reconnectRunnable);
+        mainHandler.removeCallbacks(protocolRefreshRunnable);
+        mainHandler.removeCallbacks(autoConnectWatchdogRunnable);
         if (commService != null) {
             commService.stop();
         }
+    }
+
+    @Override
+    public void onTaskRemoved(Intent rootIntent) {
+        if (foregroundStarted) {
+            updateNotification("OBD Service", "Monitoring continues in background");
+        }
+        super.onTaskRemoved(rootIntent);
     }
     
     public ServiceState getCurrentState() {
@@ -274,5 +488,224 @@ public class ObdBackgroundService extends Service {
                 listener.onConnectionStateChanged(state);
             }
         });
+    }
+
+    private BackgroundAutoConnectConfig readAutoConnectConfig() {
+        SharedPreferences preferences = PreferenceManager.getDefaultSharedPreferences(this);
+        return BackgroundAutoConnectConfig.from(
+                BackgroundAutoConnectConfig.sharedPreferencesReader(preferences));
+    }
+
+    private void scheduleReconnect() {
+        if (!autoReconnectEnabled) {
+            return;
+        }
+        mainHandler.removeCallbacks(reconnectRunnable);
+        log.info("Auto-connect retry scheduled in " + RECONNECT_DELAY_MS + "ms");
+        mainHandler.postDelayed(reconnectRunnable, RECONNECT_DELAY_MS);
+    }
+
+    private void scheduleProtocolRefresh(String reason) {
+        if (!autoReconnectEnabled) {
+            return;
+        }
+        mainHandler.removeCallbacks(protocolRefreshRunnable);
+        log.info("Protocol refresh scheduled in " + PROTOCOL_REFRESH_DELAY_MS
+                + "ms reason=" + reason + " status=" + CommService.elm.getStatus());
+        mainHandler.postDelayed(protocolRefreshRunnable, PROTOCOL_REFRESH_DELAY_MS);
+    }
+
+    private void refreshSavedConnection(String reason) {
+        if (!autoReconnectEnabled) {
+            return;
+        }
+        BackgroundAutoConnectConfig config = readAutoConnectConfig();
+        if (!config.canAutoConnect()) {
+            return;
+        }
+        CommService.STATE state = commService != null ? commService.getState() : CommService.STATE.NONE;
+        if (state == CommService.STATE.CONNECTING) {
+            return;
+        }
+        if (state == CommService.STATE.CONNECTED
+                && !ObdConnectionHealth.shouldRefreshConnection(state, CommService.elm.getStatus())) {
+            return;
+        }
+
+        log.info("Refreshing OBD connection reason=" + reason
+                + " state=" + state
+                + " protocol=" + CommService.elm.getStatus());
+        updateNotification("OBD Service", "Refreshing OBD connection...");
+        CoolantAlertDispatcher.reset(vehicleAlertNotifier, "protocol-refresh");
+        stopCommService();
+        initializeCommService();
+        connectToBluetoothDevice(config.address, config.medium, config.secure, true);
+    }
+
+    private void startAutoConnectWatchdog() {
+        mainHandler.removeCallbacks(autoConnectWatchdogRunnable);
+        mainHandler.postDelayed(autoConnectWatchdogRunnable, AUTO_CONNECT_WATCHDOG_MS);
+    }
+
+    private boolean requiresBluetoothPermission(CommService.MEDIUM medium) {
+        return medium == CommService.MEDIUM.BLUETOOTH || medium == CommService.MEDIUM.BLE;
+    }
+
+    private boolean hasBluetoothConnectPermission() {
+        return Build.VERSION.SDK_INT < Build.VERSION_CODES.S
+                || checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED;
+    }
+
+    @Override
+    public void onSharedPreferenceChanged(SharedPreferences sharedPreferences, String key) {
+        if (key == null
+                || AutomationSettings.KEY_COOLANT_MONITORING_ENABLED.equals(key)
+                || AutomationSettings.KEY_COOLANT_WARNING_THRESHOLD.equals(key)
+                || AutomationSettings.KEY_COOLANT_CRITICAL_THRESHOLD.equals(key)) {
+            if (!automationSettings.isCoolantMonitoringEnabled()) {
+                CoolantAlertDispatcher.reset(vehicleAlertNotifier, "service-preferences");
+            } else {
+                attachExistingCoolantPid();
+                evaluateCurrentCoolantTemperature();
+            }
+        }
+    }
+
+    @Override
+    public void pvChanged(PvChangeEvent event) {
+        if (event.getSource() != ObdProt.PidPvs) {
+            return;
+        }
+        if (event.getType() == PvChangeEvent.PV_ADDED && event.getValue() instanceof EcuDataPv) {
+            attachCoolantListener((EcuDataPv) event.getValue());
+            attachExistingCoolantPid();
+        } else if (event.getType() == PvChangeEvent.PV_CLEARED) {
+            detachCoolantListener();
+        }
+    }
+
+    @Override
+    public void propertyChange(PropertyChangeEvent event) {
+        if (ElmProt.PROP_STATUS.equals(event.getPropertyName())) {
+            handleProtocolStatus((ElmProt.STAT) event.getNewValue());
+        }
+
+        if (ElmProt.PROP_ECU_ADDRESS.equals(event.getPropertyName()) && stateListeners.isEmpty()) {
+            restorePreferredEcu(event.getNewValue());
+        } else if (ElmProt.PROP_STATUS.equals(event.getPropertyName())
+                && event.getNewValue() == ElmProt.STAT.ECU_DETECTED
+                && stateListeners.isEmpty()
+                && CommService.elm.getService() == ObdProt.OBD_SVC_NONE) {
+            CommService.elm.setService(ObdProt.OBD_SVC_DATA);
+            attachExistingCoolantPid();
+        } else if (ElmProt.PROP_STATUS.equals(event.getPropertyName())
+                && event.getNewValue() == ElmProt.STAT.ECU_DETECTED) {
+            attachExistingCoolantPid();
+        }
+    }
+
+    private void handleProtocolStatus(ElmProt.STAT protocolState) {
+        CommService.STATE transportState = commService != null
+                ? commService.getState()
+                : CommService.STATE.NONE;
+        if (transportState != CommService.STATE.CONNECTED) {
+            return;
+        }
+
+        updateNotification("OBD Service", getProtocolNotificationText(protocolState));
+        if (ObdConnectionHealth.isVehicleResponsive(transportState, protocolState)) {
+            mainHandler.removeCallbacks(protocolRefreshRunnable);
+            return;
+        }
+
+        if (ObdConnectionHealth.shouldRefreshConnection(transportState, protocolState)) {
+            CoolantAlertDispatcher.reset(vehicleAlertNotifier, "protocol-unavailable");
+            scheduleProtocolRefresh("protocol-" + protocolState);
+        }
+    }
+
+    private String getProtocolNotificationText(ElmProt.STAT protocolState) {
+        if (ObdConnectionHealth.isVehicleResponsive(CommService.STATE.CONNECTED, protocolState)) {
+            return "ECU connected - Monitoring vehicle data";
+        }
+        switch (protocolState) {
+            case INITIALIZING:
+            case INITIALIZED:
+            case ECU_DETECT:
+            case ECU_DETECTED:
+            case CONNECTING:
+                return "OBD adapter connected - detecting ECU...";
+
+            case NODATA:
+            case DISCONNECTED:
+                return "OBD adapter connected - waiting for ignition/ECU";
+
+            default:
+                return "OBD adapter connected - ECU unavailable";
+        }
+    }
+
+    private void restorePreferredEcu(Object value) {
+        if (!(value instanceof Set)) {
+            return;
+        }
+        int address = preferences.getInt(MainActivity.PRESELECT.LAST_ECU_ADDRESS.toString(), 0);
+        if (((Set<?>) value).contains(address)) {
+            CommService.elm.setEcuAddress(address);
+        }
+    }
+
+    private void attachExistingCoolantPid() {
+        for (Object value : new ArrayList<>(ObdProt.PidPvs.values())) {
+            if (value instanceof EcuDataPv) {
+                if (attachCoolantListener((EcuDataPv) value)) {
+                    return;
+                }
+            }
+        }
+    }
+
+    private boolean attachCoolantListener(EcuDataPv dataPv) {
+        if (dataPv.getAsInt(EcuDataPv.FID_PID) != CoolantAlertDispatcher.COOLANT_PID) {
+            return false;
+        }
+        if (coolantDataPv == dataPv) {
+            evaluateCurrentCoolantTemperature();
+            return true;
+        }
+        detachCoolantListener();
+        coolantDataPv = dataPv;
+        coolantDataPv.addPvChangeListener(coolantChangeListener, PvChangeEvent.PV_MODIFIED);
+        log.info("Coolant monitor attached source=service pid=0x05");
+        evaluateCurrentCoolantTemperature();
+        return true;
+    }
+
+    private void detachCoolantListener() {
+        if (coolantDataPv != null) {
+            coolantDataPv.removePvChangeListener(coolantChangeListener);
+            coolantDataPv = null;
+            log.info("Coolant monitor detached source=service");
+        }
+    }
+
+    private void evaluateCurrentCoolantTemperature() {
+        if (coolantDataPv == null) {
+            return;
+        }
+        Object value = coolantDataPv.get(EcuDataPv.FID_VALUE);
+        if (value instanceof Number) {
+            evaluateCoolantTemperature(((Number) value).doubleValue());
+        }
+    }
+
+    private void evaluateCoolantTemperature(double temperature) {
+        CoolantAlertDispatcher.evaluate(
+                temperature,
+                automationSettings,
+                CommService.elm.getService(),
+                vehicleEventLog,
+                vehicleAlertNotifier,
+                "service");
     }
 }

@@ -1,10 +1,14 @@
 package com.fr3ts0n.ecu.prot.obd;
 
 import com.fr3ts0n.ecu.EcuDataItem;
+import com.fr3ts0n.prot.TelegramWriter;
 import com.fr3ts0n.pvs.PvChangeEvent;
 import com.fr3ts0n.pvs.PvChangeListener;
 
 import org.junit.jupiter.api.Test;
+
+import java.util.ArrayList;
+import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 
@@ -200,6 +204,35 @@ class ElmProtTest
 
 		assertEquals(1, ObdProt.tCodes.size());
 		assertEquals(true, ObdProt.tCodes.containsKey(0x0000));
+	}
+
+	@Test
+	void handleTelegram_ReadDfc_NoDataContinuesWithoutProtocolReconnect()
+	{
+		ElmProt localProt = new ElmProt();
+		List<String> telegrams = new ArrayList<>();
+		localProt.addTelegramWriter(new TelegramWriter()
+		{
+			@Override
+			public int writeTelegram(char[] buffer)
+			{
+				telegrams.add(new String(buffer));
+				return buffer.length;
+			}
+
+			@Override
+			public int writeTelegram(char[] buffer, int type, Object id)
+			{
+				return writeTelegram(buffer);
+			}
+		});
+
+		localProt.setService(ObdProt.OBD_SVC_READ_CODES);
+		telegrams.clear();
+		localProt.handleTelegram("NODATA".toCharArray());
+		localProt.handleTelegram(">".toCharArray());
+
+		assertEquals(List.of("0A"), telegrams);
 	}
 
 	/**

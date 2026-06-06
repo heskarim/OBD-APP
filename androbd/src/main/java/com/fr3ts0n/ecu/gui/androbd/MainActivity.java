@@ -84,11 +84,16 @@ import java.beans.PropertyChangeListener;
 import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.OutputStream;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.Comparator;
 import java.util.Date;
 import java.util.HashSet;
+import java.util.IdentityHashMap;
+import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.Timer;
@@ -169,6 +174,7 @@ public class MainActivity extends PluginManager
     private static final int REQUEST_GRAPH_DISPLAY_DONE = 7;
     private static final int REQUEST_BT_PERMISSIONS = 8;
     private static final int REQUEST_NOTIFICATIONS = 9;
+    private static final int REQUEST_EXPORT_RECORDING = 10;
     /**
      * app exit parameters
      */
@@ -177,6 +183,10 @@ public class MainActivity extends PluginManager
      * time between display updates to represent data changes
      */
     private static final int DISPLAY_UPDATE_TIME = 250;
+    private static final long DTC_EVALUATION_DELAY_MS = 2000;
+    private static final long AUTO_CLEAR_COOLDOWN_MS = 60000;
+    private static final long RECORDING_SNAPSHOT_INTERVAL_MS = 1000;
+    private static final long RECORDING_STALE_THRESHOLD_MS = 3000;
     private static final String LOG_MASTER = "log_master";
     private static final String KEEP_SCREEN_ON = "keep_screen_on";
     private static final String ELM_CUSTOM_INIT_CMDS = "elm_custom_init_cmds";
@@ -288,6 +298,11 @@ public class MainActivity extends PluginManager
             obdBackgroundService = binder.getService();
             serviceBound = true;
             obdBackgroundService.addStateListener(MainActivity.this);
+            if (CommService.medium == CommService.MEDIUM.BLUETOOTH
+                    || CommService.medium == CommService.MEDIUM.BLE)
+            {
+                obdBackgroundService.connectToSavedDevice();
+            }
             log.info("Connected to OBD background service");
         }
 
@@ -330,6 +345,56 @@ public class MainActivity extends PluginManager
      * current operating mode
      */
     private MODE mode = MODE.OFFLINE;
+    private AutomationSettings automationSettings;
+    private VehicleAlertNotifier vehicleAlertNotifier;
+    private SensorRecorder sensorRecorder;
+    private VehicleEventLog vehicleEventLog;
+    private DiagnosticLogManager diagnosticLogManager;
+    private long lastAutoClearTime;
+    private EcuDataPv coolantDataPv;
+    private final Set<EcuDataPv> recordingPvs =
+            Collections.newSetFromMap(new IdentityHashMap<>());
+    private final Map<EcuDataPv, Long> recordingLastUpdateTimes = new IdentityHashMap<>();
+    private final Runnable dtcEvaluationRunnable = this::evaluateDtcAutomation;
+    private final Runnable recordingSnapshotRunnable = new Runnable()
+    {
+        @Override
+        public void run()
+        {
+            if (!sensorRecorder.isRecording())
+            {
+                return;
+            }
+
+            recordCurrentSensorValues();
+            mHandler.postDelayed(this, RECORDING_SNAPSHOT_INTERVAL_MS);
+        }
+    };
+    private final PvChangeListener coolantChangeListener = event ->
+    {
+        if (EcuDataPv.FIELDS[EcuDataPv.FID_VALUE].equals(event.getKey())
+                && event.getValue() instanceof Number)
+        {
+            double temperature = ((Number) event.getValue()).doubleValue();
+            evaluateCoolantTemperature(temperature);
+        }
+    };
+    private final PvChangeListener recordingChangeListener = event ->
+    {
+        if (EcuDataPv.FIELDS[EcuDataPv.FID_VALUE].equals(event.getKey())
+                && event.getSource() instanceof EcuDataPv)
+        {
+            EcuDataPv pv = (EcuDataPv) event.getSource();
+            recordingLastUpdateTimes.put(pv, event.getTime());
+            recordSensorValue(
+                    pv,
+                    event.getTime(),
+                    event.getValue(),
+                    "update",
+                    false,
+                    0);
+        }
+    };
     /**
      * Handle message requests using modern Handler implementation
      * Compatible with both old and new Android versions
@@ -414,11 +479,26 @@ public class MainActivity extends PluginManager
                                 {
                                     if (event.getSource() == ObdProt.PidPvs)
                                     {
+                                        if (event.getValue() instanceof EcuDataPv)
+                                        {
+                                            attachCoolantListener((EcuDataPv) event.getValue());
+                                            attachRecordingListener((EcuDataPv) event.getValue());
+                                        }
+                                        attachExistingCoolantPid();
                                         // append plugin measurements to data list
                                         currDataAdapter.addAll(mPluginPvs.values());
                                         // Check if last data selection shall be restored
                                         checkToRestoreLastDataSelection();
                                         checkToRestoreLastViewMode();
+                                    }
+                                    else if (event.getSource() == ObdProt.tCodes)
+                                    {
+                                        scheduleDtcEvaluation();
+                                    }
+                                    else if (event.getSource() == mPluginPvs
+                                            && event.getValue() instanceof EcuDataPv)
+                                    {
+                                        attachRecordingListener((EcuDataPv) event.getValue());
                                     }
                                 } catch (Exception e)
                                 {
@@ -428,6 +508,19 @@ public class MainActivity extends PluginManager
 
                             case PvChangeEvent.PV_CLEARED:
                                 currDataAdapter.clear();
+                                if (event.getSource() == ObdProt.PidPvs)
+                                {
+                                    detachCoolantListener();
+                                    detachRecordingListeners();
+                                }
+                                else if (event.getSource() == ObdProt.tCodes)
+                                {
+                                    scheduleDtcEvaluation();
+                                }
+                                else if (event.getSource() == mPluginPvs)
+                                {
+                                    detachRecordingListeners();
+                                }
                                 break;
                         }
                         break;
@@ -582,6 +675,11 @@ public class MainActivity extends PluginManager
 
         // get preferences
         prefs = PreferenceManager.getDefaultSharedPreferences(this);
+        automationSettings = new AutomationSettings(prefs);
+        vehicleAlertNotifier = new VehicleAlertNotifier(this);
+        sensorRecorder = new SensorRecorder();
+        vehicleEventLog = VehicleEventLog.getShared();
+        diagnosticLogManager = new DiagnosticLogManager(this, prefs);
         // register for later changes
         prefs.registerOnSharedPreferenceChangeListener(this);
 
@@ -607,6 +705,7 @@ public class MainActivity extends PluginManager
         log.info(String.format("%s %s starting",
                 getString(R.string.app_name),
                 getString(R.string.app_version)));
+        AppUpdateManager.checkAutomatically(this);
 
         // update all settings from preferences
         onSharedPreferenceChanged(prefs, null);
@@ -618,6 +717,7 @@ public class MainActivity extends PluginManager
         fileHelper = new FileHelper(this);
         // set listeners for data structure changes
         setDataListeners();
+        attachExistingCoolantPid();
         // automate elm status display
         CommService.elm.addPropertyChangeListener(this);
 
@@ -658,11 +758,12 @@ public class MainActivity extends PluginManager
             }
         }
 
-        initSelectedMode();
-
         // Bind to background OBD service for continuous monitoring
+        BackgroundStartupReceiver.startMonitoringService(this);
         Intent serviceIntent = new Intent(this, ObdBackgroundService.class);
         bindService(serviceIntent, serviceConnection, Context.BIND_AUTO_CREATE);
+
+        initSelectedMode();
     }
 
     /**
@@ -721,10 +822,10 @@ public class MainActivity extends PluginManager
                         else
                         {
                             // last device to be auto-connected?
-                            if(istRestoreWanted(PRESELECT.LAST_DEV_ADDRESS))
+                            if(istRestoreWanted(PRESELECT.LAST_DEV_ADDRESS)
+                                    && prefs.getString(PRESELECT.LAST_DEV_ADDRESS.toString(), null) != null)
                             {
-                                // auto-connect ...
-                                setMode(MODE.ONLINE);
+                                setStatus(R.string.title_connecting);
                             }
                             else
                             {
@@ -837,6 +938,10 @@ public class MainActivity extends PluginManager
         }
 
         /* don't listen to ELM data changes any more */
+        mHandler.removeCallbacks(dtcEvaluationRunnable);
+        mHandler.removeCallbacks(recordingSnapshotRunnable);
+        detachCoolantListener();
+        detachRecordingListeners();
         removeDataListeners();
         // don't listen to ELM property changes any more
         CommService.elm.removePropertyChangeListener(this);
@@ -990,13 +1095,17 @@ public class MainActivity extends PluginManager
 
             // Connection Management
             if(id == R.id.secure_connect_scan) {
-                setMode(MODE.ONLINE);
+                connectFromMenu();
                 return true;
             }
 
             if(id == R.id.disconnect) {
                 // stop communication service
-                if (mCommService != null) {
+                if (obdBackgroundService != null
+                        && (CommService.medium == CommService.MEDIUM.BLUETOOTH
+                        || CommService.medium == CommService.MEDIUM.BLE)) {
+                    obdBackgroundService.disconnect();
+                } else if (mCommService != null) {
                     mCommService.stop();
                 }
                 setMode(MODE.OFFLINE);
@@ -1032,6 +1141,21 @@ public class MainActivity extends PluginManager
             if(id == R.id.load) {
                 setMode(MODE.FILE);
                 selectFileToLoad();
+                return true;
+            }
+
+            if(id == R.id.recording) {
+                showRecordingDialog();
+                return true;
+            }
+
+            if(id == R.id.diagnostic_logs) {
+                showDiagnosticLogDialog();
+                return true;
+            }
+
+            if(id == R.id.check_updates) {
+                AppUpdateManager.checkNow(this);
                 return true;
             }
 
@@ -1207,6 +1331,13 @@ public class MainActivity extends PluginManager
                 }
                 break;
 
+            case REQUEST_EXPORT_RECORDING:
+                if (resultCode == RESULT_OK && data != null)
+                {
+                    exportRecordingToUri(data.getData());
+                }
+                break;
+
             // settings finished
             case REQUEST_SETTINGS:
             {
@@ -1234,6 +1365,27 @@ public class MainActivity extends PluginManager
     @Override
     public void onSharedPreferenceChanged(SharedPreferences prefs, String key)
     {
+        if (key == null || AutomationSettings.KEY_AUTO_CLEAR_ENABLED.equals(key)
+                || AutomationSettings.KEY_APPROVED_DTCS.equals(key))
+        {
+            scheduleDtcEvaluation();
+        }
+        if (key == null
+                || AutomationSettings.KEY_COOLANT_MONITORING_ENABLED.equals(key)
+                || AutomationSettings.KEY_COOLANT_WARNING_THRESHOLD.equals(key)
+                || AutomationSettings.KEY_COOLANT_CRITICAL_THRESHOLD.equals(key))
+        {
+            if (!automationSettings.isCoolantMonitoringEnabled())
+            {
+                CoolantAlertDispatcher.reset(vehicleAlertNotifier, "activity-preferences");
+            }
+            else
+            {
+                attachExistingCoolantPid();
+                evaluateCurrentCoolantTemperature();
+            }
+        }
+
         // keep main display on?
         if (key == null || KEEP_SCREEN_ON.equals(key))
         {
@@ -1474,14 +1626,11 @@ public class MainActivity extends PluginManager
             case ObdProt.OBD_SVC_PENDINGCODES:
                 try
                 {
-                    intent = new Intent(Intent.ACTION_WEB_SEARCH);
                     EcuCodeItem dfc = (EcuCodeItem) getListAdapter().getItem(position);
-                    intent.putExtra(SearchManager.QUERY,
-                            "OBD " + String.valueOf(dfc.get(EcuCodeItem.FID_CODE)));
-                    startActivity(intent);
+                    showDtcActions(String.valueOf(dfc.get(EcuCodeItem.FID_CODE)));
                 } catch (Exception e)
                 {
-                    log.log(Level.SEVERE, "WebSearch DFC", e);
+                    log.log(Level.SEVERE, "DTC action", e);
                     Toast.makeText(this, e.getMessage(), Toast.LENGTH_LONG).show();
                 }
                 break;
@@ -1506,6 +1655,44 @@ public class MainActivity extends PluginManager
                 break;
         }
         return true;
+    }
+
+    private void showDtcActions(String code)
+    {
+        boolean approved = automationSettings.isDtcApproved(code);
+        CharSequence[] actions =
+        {
+                getString(approved
+                                ? R.string.remove_from_approved_dtcs
+                                : R.string.add_to_approved_dtcs,
+                        code),
+                getString(R.string.search_dtc_online)
+        };
+
+        new AlertDialog.Builder(this)
+                .setTitle(code)
+                .setItems(actions, (dialog, which) ->
+                {
+                    if (which == 0)
+                    {
+                        automationSettings.setDtcApproved(code, !approved);
+                        Toast.makeText(
+                                this,
+                                getString(approved
+                                                ? R.string.dtc_approved_removed
+                                                : R.string.dtc_approved_added,
+                                        code),
+                                Toast.LENGTH_SHORT)
+                                .show();
+                    }
+                    else
+                    {
+                        Intent searchIntent = new Intent(Intent.ACTION_WEB_SEARCH);
+                        searchIntent.putExtra(SearchManager.QUERY, "OBD " + code);
+                        startActivity(searchIntent);
+                    }
+                })
+                .show();
     }
 
     /**
@@ -1853,6 +2040,466 @@ public class MainActivity extends PluginManager
         return result;
     }
 
+    private void scheduleDtcEvaluation()
+    {
+        mHandler.removeCallbacks(dtcEvaluationRunnable);
+        mHandler.postDelayed(dtcEvaluationRunnable, DTC_EVALUATION_DELAY_MS);
+    }
+
+    private void evaluateDtcAutomation()
+    {
+        if (!automationSettings.isAutoClearEnabled())
+        {
+            vehicleAlertNotifier.showUnknownDtcs(new HashSet<>());
+            return;
+        }
+
+        int service = CommService.elm.getService();
+        boolean readingCodes = service == ObdProt.OBD_SVC_READ_CODES
+                || service == ObdProt.OBD_SVC_PENDINGCODES
+                || service == ObdProt.OBD_SVC_PERMACODES;
+        if (getMode() != MODE.ONLINE || !readingCodes)
+        {
+            return;
+        }
+
+        Set<String> detectedCodes = collectDetectedDtcCodes();
+        Set<String> approvedCodes = automationSettings.getApprovedDtcs();
+        DtcAutoClearPolicy.Decision decision =
+                DtcAutoClearPolicy.evaluate(detectedCodes, approvedCodes);
+
+        if (decision == DtcAutoClearPolicy.Decision.CLEAR_ALLOWED)
+        {
+            vehicleAlertNotifier.showUnknownDtcs(new HashSet<>());
+            long now = System.currentTimeMillis();
+            if (now - lastAutoClearTime >= AUTO_CLEAR_COOLDOWN_MS)
+            {
+                lastAutoClearTime = now;
+                String codes = DtcAutoClearPolicy.formatCodes(detectedCodes);
+                int clearCount = vehicleEventLog.recordDtcClear(now, "auto_clear", codes);
+                vehicleAlertNotifier.showDtcClear(codes, clearCount);
+                Toast.makeText(
+                                this,
+                                getString(
+                                        R.string.auto_clearing_approved_dtcs,
+                                        codes),
+                                Toast.LENGTH_LONG)
+                        .show();
+                CommService.elm.setService(ObdProt.OBD_SVC_CLEAR_CODES);
+                CommService.elm.setService(ObdProt.OBD_SVC_READ_CODES);
+            }
+        }
+        else if (decision == DtcAutoClearPolicy.Decision.UNKNOWN_CODES)
+        {
+            Set<String> unknownCodes = DtcAutoClearPolicy.unknownCodes(detectedCodes, approvedCodes);
+            String codes = DtcAutoClearPolicy.formatCodes(unknownCodes);
+            vehicleEventLog.recordUnknownDtcsBlocked(System.currentTimeMillis(), codes);
+            vehicleAlertNotifier.showUnknownDtcs(unknownCodes);
+        }
+        else
+        {
+            vehicleAlertNotifier.showUnknownDtcs(new HashSet<>());
+        }
+    }
+
+    private Set<String> collectDetectedDtcCodes()
+    {
+        Set<String> result = new HashSet<>();
+        for (Object value : new ArrayList<>(ObdProt.tCodes.values()))
+        {
+            if (value instanceof EcuCodeItem)
+            {
+                result.add(String.valueOf(((EcuCodeItem) value).get(EcuCodeItem.FID_CODE)));
+            }
+        }
+        return result;
+    }
+
+    private void showRecordingDialog()
+    {
+        boolean active = sensorRecorder.isRecording();
+        long now = System.currentTimeMillis();
+        String message = active
+                ? getString(
+                        R.string.recording_active,
+                        sensorRecorder.getDurationMs(now) / 1000,
+                        sensorRecorder.getSampleCount(),
+                        vehicleEventLog.getEventCount(),
+                        vehicleEventLog.getClearCount())
+                : getString(
+                        R.string.recording_not_started,
+                        sensorRecorder.getSampleCount(),
+                        vehicleEventLog.getEventCount(),
+                        vehicleEventLog.getClearCount());
+
+        new AlertDialog.Builder(this)
+                .setTitle(R.string.recording)
+                .setMessage(message)
+                .setPositiveButton(
+                        active ? R.string.recording_stop : R.string.recording_start,
+                        (dialog, which) ->
+                        {
+                            if (active)
+                            {
+                                stopSensorRecording();
+                            }
+                            else
+                            {
+                                startSensorRecording();
+                            }
+                        })
+                .setNeutralButton(R.string.recording_export, (dialog, which) -> requestRecordingExport())
+                .setNegativeButton(android.R.string.cancel, null)
+                .show();
+    }
+
+    private void startSensorRecording()
+    {
+        sensorRecorder.start(System.currentTimeMillis());
+        vehicleEventLog.recordEvent(System.currentTimeMillis(), "recording_started", "Recording started");
+        attachAllRecordingListeners();
+        recordCurrentSensorValues();
+        mHandler.removeCallbacks(recordingSnapshotRunnable);
+        mHandler.postDelayed(recordingSnapshotRunnable, RECORDING_SNAPSHOT_INTERVAL_MS);
+        Toast.makeText(this, R.string.recording_started, Toast.LENGTH_SHORT).show();
+    }
+
+    private void showDiagnosticLogDialog()
+    {
+        boolean active = diagnosticLogManager.isActive();
+        new AlertDialog.Builder(this)
+                .setTitle(R.string.diagnostic_logs)
+                .setMessage(active
+                        ? R.string.diagnostic_logging_active
+                        : R.string.diagnostic_logging_inactive)
+                .setPositiveButton(
+                        active
+                                ? R.string.diagnostic_logging_stop
+                                : R.string.diagnostic_logging_start,
+                        (dialog, which) ->
+                        {
+                            if (active)
+                            {
+                                diagnosticLogManager.stop();
+                                Toast.makeText(
+                                        this,
+                                        R.string.diagnostic_logging_stopped,
+                                        Toast.LENGTH_SHORT).show();
+                            }
+                            else
+                            {
+                                startDiagnosticLogging();
+                            }
+                        })
+                .setNeutralButton(
+                        R.string.diagnostic_logging_export,
+                        (dialog, which) -> exportDiagnosticLogs())
+                .setNegativeButton(android.R.string.cancel, null)
+                .show();
+    }
+
+    private void startDiagnosticLogging()
+    {
+        try
+        {
+            diagnosticLogManager.start();
+            Toast.makeText(this, R.string.diagnostic_logging_started, Toast.LENGTH_LONG).show();
+        }
+        catch (Exception e)
+        {
+            log.log(Level.SEVERE, "Start diagnostic logging", e);
+            Toast.makeText(
+                    this,
+                    getString(R.string.diagnostic_logging_failed, e.getMessage()),
+                    Toast.LENGTH_LONG).show();
+        }
+    }
+
+    private void exportDiagnosticLogs()
+    {
+        executor.execute(() ->
+        {
+            try
+            {
+                DiagnosticLogManager.Result result = diagnosticLogManager.exportToDownloads();
+                mHandler.post(() -> Toast.makeText(
+                        this,
+                        getString(R.string.diagnostic_logging_exported, result.displayName),
+                        Toast.LENGTH_LONG).show());
+            }
+            catch (Exception e)
+            {
+                log.log(Level.SEVERE, "Export diagnostic logs", e);
+                mHandler.post(() -> Toast.makeText(
+                        this,
+                        getString(R.string.diagnostic_logging_failed, e.getMessage()),
+                        Toast.LENGTH_LONG).show());
+            }
+        });
+    }
+
+    private void stopSensorRecording()
+    {
+        sensorRecorder.stop(System.currentTimeMillis());
+        vehicleEventLog.recordEvent(System.currentTimeMillis(), "recording_stopped", "Recording stopped");
+        mHandler.removeCallbacks(recordingSnapshotRunnable);
+        detachRecordingListeners();
+        Toast.makeText(this, R.string.recording_stopped, Toast.LENGTH_SHORT).show();
+    }
+
+    private void requestRecordingExport()
+    {
+        if (sensorRecorder.getSampleCount() == 0 && vehicleEventLog.getEventCount() == 0)
+        {
+            Toast.makeText(this, R.string.recording_no_samples, Toast.LENGTH_LONG).show();
+            return;
+        }
+
+        exportRecordingToDownloads();
+    }
+
+    private void exportRecordingToUri(Uri uri)
+    {
+        if (uri == null)
+        {
+            return;
+        }
+
+        executor.execute(() ->
+        {
+            try (OutputStream outputStream = getContentResolver().openOutputStream(uri))
+            {
+                prepareRecordingExportSnapshot();
+                sensorRecorder.writeZip(outputStream, vehicleEventLog, getString(R.string.app_name));
+                mHandler.post(() -> Toast.makeText(
+                        this,
+                        R.string.recording_exported,
+                        Toast.LENGTH_LONG).show());
+            }
+            catch (Exception e)
+            {
+                log.log(Level.SEVERE, "Export recording", e);
+                mHandler.post(() -> Toast.makeText(
+                        this,
+                        getString(R.string.recording_export_failed, e.getMessage()),
+                        Toast.LENGTH_LONG).show());
+            }
+        });
+    }
+
+    private void exportRecordingToDownloads()
+    {
+        executor.execute(() ->
+        {
+            try
+            {
+                prepareRecordingExportSnapshot();
+                RecordingExporter.Result result = RecordingExporter.exportToDownloads(
+                        this,
+                        sensorRecorder,
+                        vehicleEventLog,
+                        getString(R.string.app_name));
+
+                mHandler.post(() -> Toast.makeText(
+                        this,
+                        getString(R.string.recording_exported_to, result.displayName),
+                        Toast.LENGTH_LONG).show());
+            }
+            catch (Exception e)
+            {
+                log.log(Level.SEVERE, "Export recording", e);
+                mHandler.post(() -> Toast.makeText(
+                        this,
+                        getString(R.string.recording_export_failed, e.getMessage()),
+                        Toast.LENGTH_LONG).show());
+            }
+        });
+    }
+
+    private void attachAllRecordingListeners()
+    {
+        for (Object value : new ArrayList<>(ObdProt.PidPvs.values()))
+        {
+            if (value instanceof EcuDataPv)
+            {
+                attachRecordingListener((EcuDataPv) value);
+            }
+        }
+        for (Object value : new ArrayList<>(mPluginPvs.values()))
+        {
+            if (value instanceof EcuDataPv)
+            {
+                attachRecordingListener((EcuDataPv) value);
+            }
+        }
+    }
+
+    private void attachRecordingListener(EcuDataPv dataPv)
+    {
+        if (dataPv == null || !sensorRecorder.isRecording() || recordingPvs.contains(dataPv))
+        {
+            return;
+        }
+
+        dataPv.addPvChangeListener(recordingChangeListener, PvChangeEvent.PV_MODIFIED);
+        recordingPvs.add(dataPv);
+        sensorRecorder.recordAvailableSensor(
+                dataPv.getAsInt(EcuDataPv.FID_PID),
+                String.valueOf(dataPv.get(EcuDataPv.FID_MNEMONIC)),
+                String.valueOf(dataPv.get(EcuDataPv.FID_DESCRIPT)),
+                String.valueOf(dataPv.get(EcuDataPv.FID_UNITS)));
+    }
+
+    private void detachRecordingListeners()
+    {
+        for (EcuDataPv pv : new ArrayList<>(recordingPvs))
+        {
+            pv.removePvChangeListener(recordingChangeListener);
+        }
+        recordingPvs.clear();
+        recordingLastUpdateTimes.clear();
+    }
+
+    private void recordCurrentSensorValues()
+    {
+        long now = System.currentTimeMillis();
+        for (EcuDataPv pv : new ArrayList<>(recordingPvs))
+        {
+            Long lastUpdate = recordingLastUpdateTimes.get(pv);
+            boolean stale = lastUpdate == null || now - lastUpdate > RECORDING_STALE_THRESHOLD_MS;
+            long ageMs = lastUpdate == null ? -1 : now - lastUpdate;
+            recordSensorValue(
+                    pv,
+                    now,
+                    pv.get(EcuDataPv.FID_VALUE),
+                    "snapshot",
+                    stale,
+                    ageMs);
+        }
+    }
+
+    private void recordSensorValue(
+            EcuDataPv pv,
+            long timestampMs,
+            Object value,
+            String sampleType,
+            boolean stale,
+            long ageMs)
+    {
+        int pid = pv.getAsInt(EcuDataPv.FID_PID);
+        String mnemonic = String.valueOf(pv.get(EcuDataPv.FID_MNEMONIC));
+        String description = String.valueOf(pv.get(EcuDataPv.FID_DESCRIPT));
+        String units = String.valueOf(pv.get(EcuDataPv.FID_UNITS));
+        sensorRecorder.recordSample(
+                timestampMs,
+                pid,
+                mnemonic,
+                description,
+                value,
+                units,
+                sampleType,
+                stale,
+                ageMs);
+        if (CommService.elm.getService() == ObdProt.OBD_SVC_FREEZEFRAME)
+        {
+            sensorRecorder.recordFreezeFrameValue(
+                    timestampMs,
+                    pid,
+                    mnemonic,
+                    description,
+                    value,
+                    units);
+        }
+    }
+
+    private void prepareRecordingExportSnapshot()
+    {
+        sensorRecorder.setDtcSnapshot(collectDtcRecords());
+    }
+
+    private List<SensorRecorder.DtcRecord> collectDtcRecords()
+    {
+        List<SensorRecorder.DtcRecord> result = new ArrayList<>();
+        for (Object value : new ArrayList<>(ObdProt.tCodes.values()))
+        {
+            if (value instanceof EcuCodeItem)
+            {
+                EcuCodeItem code = (EcuCodeItem) value;
+                result.add(new SensorRecorder.DtcRecord(
+                        code.getAsInt(EcuCodeItem.FID_STATUS),
+                        String.valueOf(code.get(EcuCodeItem.FID_CODE)),
+                        String.valueOf(code.get(EcuCodeItem.FID_DESCRIPT))));
+            }
+        }
+        return result;
+    }
+
+    private void attachExistingCoolantPid()
+    {
+        for (Object value : new ArrayList<>(ObdProt.PidPvs.values()))
+        {
+            if (value instanceof EcuDataPv && attachCoolantListener((EcuDataPv) value))
+            {
+                return;
+            }
+        }
+    }
+
+    private boolean attachCoolantListener(EcuDataPv dataPv)
+    {
+        if (dataPv == null || dataPv.getAsInt(EcuDataPv.FID_PID) != CoolantAlertDispatcher.COOLANT_PID)
+        {
+            return false;
+        }
+        if (coolantDataPv == dataPv)
+        {
+            evaluateCurrentCoolantTemperature();
+            return true;
+        }
+
+        detachCoolantListener();
+        coolantDataPv = dataPv;
+        coolantDataPv.addPvChangeListener(coolantChangeListener, PvChangeEvent.PV_MODIFIED);
+        log.info("Coolant monitor attached source=activity pid=0x05");
+        evaluateCurrentCoolantTemperature();
+        return true;
+    }
+
+    private void detachCoolantListener()
+    {
+        if (coolantDataPv != null)
+        {
+            coolantDataPv.removePvChangeListener(coolantChangeListener);
+            coolantDataPv = null;
+            log.info("Coolant monitor detached source=activity");
+        }
+    }
+
+    private void evaluateCurrentCoolantTemperature()
+    {
+        if (coolantDataPv == null)
+        {
+            return;
+        }
+
+        Object value = coolantDataPv.get(EcuDataPv.FID_VALUE);
+        if (value instanceof Number)
+        {
+            evaluateCoolantTemperature(((Number) value).doubleValue());
+        }
+    }
+
+    private void evaluateCoolantTemperature(double temperature)
+    {
+        CoolantAlertDispatcher.evaluate(
+                temperature,
+                automationSettings,
+                CommService.elm.getService(),
+                vehicleEventLog,
+                vehicleAlertNotifier,
+                "activity");
+    }
+
     /**
      * set listeners for data structure changes
      */
@@ -2172,7 +2819,7 @@ public class MainActivity extends PluginManager
      */
     private void stopDemoService()
     {
-        if (getMode() == MODE.DEMO)
+        if (ElmProt.runDemo)
         {
             ElmProt.runDemo = false;
             Toast.makeText(this, getString(R.string.demo_stopped), Toast.LENGTH_SHORT).show();
@@ -2292,11 +2939,7 @@ public class MainActivity extends PluginManager
      */
     private void connectBtDevice(String address, boolean secure)
     {
-        // Get the BluetoothDevice object
-        BluetoothDevice device = mBluetoothAdapter.getRemoteDevice(address);
-        // Attempt to connect to the device
-        mCommService = new BtCommService(this, mHandler);
-        mCommService.connect(device, secure);
+        connectBackgroundBluetoothDevice(address, secure, CommService.MEDIUM.BLUETOOTH);
     }
 
     /**
@@ -2308,12 +2951,41 @@ public class MainActivity extends PluginManager
     @SuppressLint("NewApi")
     private void connectBleDevice(String address, boolean secure)
     {
-        // Get the BluetoothDevice object
-        BluetoothDevice device = mBluetoothAdapter.getRemoteLeDevice(address, ADDRESS_TYPE_PUBLIC);
-        // Attempt to connect to the device
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.JELLY_BEAN_MR2) {
-            mCommService = new BleCommService(this, mHandler);
-            mCommService.connect(device, secure);
+        connectBackgroundBluetoothDevice(address, secure, CommService.MEDIUM.BLE);
+    }
+
+    private void connectFromMenu()
+    {
+        if ((CommService.medium == CommService.MEDIUM.BLUETOOTH
+                || CommService.medium == CommService.MEDIUM.BLE)
+                && prefs.getString(PRESELECT.LAST_DEV_ADDRESS.toString(), null) != null)
+        {
+            setStatus(R.string.title_connecting);
+            BackgroundStartupReceiver.startMonitoringService(this);
+            if (obdBackgroundService != null)
+            {
+                obdBackgroundService.connectToSavedDevice();
+            }
+            return;
+        }
+        setMode(MODE.ONLINE);
+    }
+
+    private void connectBackgroundBluetoothDevice(
+            String address,
+            boolean secure,
+            CommService.MEDIUM medium)
+    {
+        CommService.medium = medium;
+        prefs.edit()
+                .putString(BackgroundAutoConnectConfig.KEY_LAST_DEV_ADDRESS, address)
+                .putBoolean(BackgroundAutoConnectConfig.KEY_BT_SECURE_CONNECTION, secure)
+                .putString(BackgroundAutoConnectConfig.KEY_COMM_MEDIUM, String.valueOf(medium.ordinal()))
+                .apply();
+        BackgroundStartupReceiver.startMonitoringService(this);
+        if (obdBackgroundService != null)
+        {
+            obdBackgroundService.connectToBluetoothDevice(address, medium, secure);
         }
     }
 
@@ -2533,10 +3205,37 @@ public class MainActivity extends PluginManager
         // Menu visibility will be handled by updateMenuVisibility() call in setMode
         
         setMenuItemEnable(R.id.obd_services, true);
-        // display connection status
-        setStatus(getString(R.string.title_connected_to, mConnectedDeviceName));
+        setStatus(R.string.title_connecting);
         // send RESET to Elm adapter
         CommService.elm.reset();
+    }
+
+    /**
+     * Handle a connection established by the background service.
+     */
+    @SuppressLint("StringFormatInvalid")
+    private void onBackgroundServiceConnect()
+    {
+        stopDemoService();
+
+        mode = MODE.ONLINE;
+        setMenuItemEnable(R.id.obd_services, true);
+        setStatusForProtocolHealth();
+        updateMenuVisibility();
+    }
+
+    private void setStatusForProtocolHealth()
+    {
+        ElmProt.STAT protocolState = CommService.elm.getStatus();
+        if (ObdConnectionHealth.isVehicleResponsive(
+                CommService.STATE.CONNECTED,
+                protocolState))
+        {
+            setStatus(getString(R.string.title_connected_to,
+                    mConnectedDeviceName != null ? mConnectedDeviceName : "ECU"));
+            return;
+        }
+        setStatus(getResources().getStringArray(R.array.elmcomm_states)[protocolState.ordinal()]);
     }
 
     /**
@@ -2608,6 +3307,16 @@ public class MainActivity extends PluginManager
                             @Override
                             public void onClick(DialogInterface dialog, int which)
                             {
+                                String codes = DtcAutoClearPolicy.formatCodes(collectDetectedDtcCodes());
+                                if (codes.isEmpty())
+                                {
+                                    codes = getString(R.string.obd_clearcodes);
+                                }
+                                int clearCount = vehicleEventLog.recordDtcClear(
+                                        System.currentTimeMillis(),
+                                        "manual_clear",
+                                        codes);
+                                vehicleAlertNotifier.showDtcClear(codes, clearCount);
                                 // set service CLEAR_CODES to clear the codes
                                 CommService.elm.setService(ObdProt.OBD_SVC_CLEAR_CODES);
                                 // set service READ_CODES to re-read the codes
@@ -2877,12 +3586,14 @@ public class MainActivity extends PluginManager
                 // This mirrors the existing handler logic but from the background service
                 switch (connectionState) {
                     case CONNECTED:
-                        setMode(MODE.ONLINE);
+                        onBackgroundServiceConnect();
                         break;
                     case CONNECTING:
                         // Show connecting status
+                        setStatus(R.string.title_connecting);
                         break;
                     case NONE:
+                    case OFFLINE:
                         setMode(MODE.OFFLINE);
                         break;
                 }
