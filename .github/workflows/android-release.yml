@@ -49,14 +49,21 @@ jobs:
           ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: ./gradlew :androbd:assembleRelease --no-daemon --max-workers=2
 
-      - name: Publish GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: app-${{ github.run_number }}
-          name: OBD APP ${{ env.VERSION_NAME }}
-          make_latest: true
-          body: |
+      - name: Write release notes
+        run: |
+          cat > "$RUNNER_TEMP/release-notes.txt" <<'EOF'
             version_code=${{ env.VERSION_CODE }}
             version_name=${{ env.VERSION_NAME }}
             commit=${{ github.sha }}
-          files: androbd/build/outputs/apk/release/androbd-release.apk
+          EOF
+
+      - name: Publish GitHub Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "app-${GITHUB_RUN_NUMBER}" \
+            "androbd/build/outputs/apk/release/androbd-release.apk" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "OBD APP ${VERSION_NAME}" \
+            --notes-file "$RUNNER_TEMP/release-notes.txt" \
+            --latest
